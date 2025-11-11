@@ -1,0 +1,80 @@
+name: AppSec Scanner
+# Runs SAST (Semgrep), SCA (Trivy), and IaC (terrascan) scans
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Run SAST / SCA / IaC scans
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install Semgrep
+        run: |
+          set -e -o pipefail
+          python -m pip install --upgrade pip
+          pip install semgrep --quiet
+        shell: bash
+
+      - name: Run Semgrep SAST
+        # keep non-zero exit from semgrep from failing the whole job (mirrors your original)
+        run: |
+          set -e -o pipefail
+          semgrep scan --config auto . || echo "Semgrep exited with non-zero code"
+        shell: bash
+
+      - name: Install Terrascan
+        run: |
+          set -e -o pipefail
+          # download latest terrascan release (Linux x86_64)
+          API_JSON="$(curl -s https://api.github.com/repos/tenable/terrascan/releases/latest)"
+          TAR_URL="$(echo "$API_JSON" | grep -o -E "https://.+?/terrascan_.*_Linux_x86_64.tar.gz" | head -n1)"
+          if [ -z "$TAR_URL" ]; then
+            echo "Could not find terrascan Linux x86_64 asset in release metadata"
+            exit 0
+          fi
+          curl -sL "$TAR_URL" -o terrascan.tar.gz
+          tar -xzf terrascan.tar.gz
+          sudo install -m 0755 terrascan /usr/local/bin/ || sudo mv terrascan /usr/local/bin/terrascan
+          rm -f terrascan terrascan.tar.gz
+        shell: bash
+
+      - name: Run Terrascan IaC Scan
+        run: |
+          set -e -o pipefail
+          terrascan scan . || echo "Terrascan exited with non-zero code"
+        shell: bash
+
+      - name: Install Trivy
+        run: |
+          set -e -o pipefail
+          # install official trivy installer script to /usr/local/bin
+          curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+        shell: bash
+
+      - name: Run Trivy SCA Scan (filesystem)
+        # keep exit code 0 (do not fail job) — change --exit-code if you want the job to fail on vulnerabilities
+        run: |
+          set -e -o pipefail
+          trivy fs --exit-code 0 --format table .
+        shell: bash
