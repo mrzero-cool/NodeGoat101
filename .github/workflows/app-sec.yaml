@@ -1,93 +1,401 @@
-name: Trivy SCA + OPA policy check
+name: AppSec Scanner
+# Runs SAST (Semgrep), SCA (Trivy), IaC (Terrascan), SBOM (syft), Container scanning (Trivy image), and Gitleaks.
+# Each scan uploads artifacts. The pipeline does NOT fail mid-run.
+# Final job aggregates results and fails the pipeline if any job found issues.
 
-# trigger on any push or PR (no branch names)
 on:
-  - push
-  - pull_request
+  push:
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-jobs:
-  trivy:
-    name: Run Trivy and fail on HIGH/CRITICAL via OPA
-    runs-on: ubuntu-latest
-    steps:
+env:
+  IMAGE_NAME: appsec-scanner-image
+  IMAGE_TAG: ${{ github.sha }}
 
+jobs:
+  # Gitleaks - run as independent quick job
+  gitleaks:
+    name: Secrets - Gitleaks
+    runs-on: ubuntu-latest
+    outputs:
+      issues: ${{ steps.gitleaks_check.outputs.issues }}
+    steps:
+      - name: Checkout repo (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks (action) and produce JSON report
+        id: gitleaks_run
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: --report-format=json --report-path=gitleaks-report.json
+        continue-on-error: true
+
+      - name: Check gitleaks JSON for findings
+        id: gitleaks_check
+        run: |
+          set -e -o pipefail
+          if [ ! -s gitleaks-report.json ]; then
+            echo "issues=false" >> $GITHUB_OUTPUT
+            echo "No gitleaks JSON produced."
+            exit 0
+          fi
+          # gitleaks JSON format: array of findings
+          COUNT=$(jq 'length' gitleaks-report.json || echo 0)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "Found $COUNT secret findings"
+            echo "issues=true" >> $GITHUB_OUTPUT
+          else
+            echo "issues=false" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: Upload gitleaks artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks-report.json
+
+  # SAST (Semgrep)
+  sast:
+    name: SAST - Semgrep
+    runs-on: ubuntu-latest
+    outputs:
+      issues: ${{ steps.semgrep_check.outputs.issues }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install Semgrep
+        run: |
+          set -e -o pipefail
+          python -m pip install --upgrade pip
+          pip install semgrep --quiet
+          semgrep --version
+        shell: bash
+
+      - name: Run Semgrep SAST (JSON + table)
+        id: semgrep_run
+        run: |
+          set -e -o pipefail
+          # produce machine-readable JSON for artifact/analysis; do not fail job
+          semgrep scan --config auto --json > semgrep.json 2>/dev/null || true
+          # also print human-friendly table for logs
+          semgrep scan --config auto . || true
+        shell: bash
+
+      - name: Check semgrep JSON for findings
+        id: semgrep_check
+        run: |
+          set -e -o pipefail
+          if [ ! -s semgrep.json ]; then
+            echo "issues=false" >> $GITHUB_OUTPUT
+            echo "No semgrep.json produced."
+            exit 0
+          fi
+          # semgrep JSON has "results" array
+          COUNT=$(jq '.results | length' semgrep.json || echo 0)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "Semgrep found $COUNT issues"
+            echo "issues=true" >> $GITHUB_OUTPUT
+          else
+            echo "issues=false" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: Upload Semgrep artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-json
+          path: semgrep.json
+
+  # IaC scanning (Terrascan)
+  iac:
+    name: IaC - Terrascan
+    runs-on: ubuntu-latest
+    outputs:
+      issues: ${{ steps.terrascan_check.outputs.issues }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Terrascan
+        run: |
+          set -e -o pipefail
+          API_JSON="$(curl -s https://api.github.com/repos/tenable/terrascan/releases/latest)"
+          TAR_URL="$(echo "$API_JSON" | grep -o -E "https://.+?/terrascan_.*_Linux_x86_64.tar.gz" | head -n1)"
+          if [ -z "$TAR_URL" ]; then
+            echo "Could not find terrascan Linux x86_64 asset in release metadata; skipping install"
+            exit 0
+          fi
+          curl -sL "$TAR_URL" -o terrascan.tar.gz
+          tar -xzf terrascan.tar.gz
+          sudo install -m 0755 terrascan /usr/local/bin/ || sudo mv terrascan /usr/local/bin/terrascan
+          rm -f terrascan terrascan.tar.gz
+          terrascan version
+        shell: bash
+
+      - name: Run Terrascan IaC Scan (JSON + plain)
+        id: terrascan_run
+        run: |
+          set -e -o pipefail
+          # terrascan JSON output may differ by version; try JSON, fallback to text
+          terrascan scan . -o json > terrascan.json 2>/dev/null || terrascan scan . > terrascan.txt || true
+          if [ -s terrascan.json ]; then
+            echo "Terrascan JSON written to terrascan.json"
+          else
+            echo "Terrascan JSON not produced; check terrascan.txt"
+          fi
+        shell: bash
+
+      - name: Check terrascan results for findings
+        id: terrascan_check
+        run: |
+          set -e -o pipefail
+          # heuristics:
+          if [ -s terrascan.json ]; then
+            # check for 'results' or 'violations' depending on terrascan output shape
+            # try common keys
+            VCOUNT=$(jq '[.results[]?.violations[]?] | length' terrascan.json 2>/dev/null || echo 0)
+            if [ "$VCOUNT" -eq 0 ]; then
+              # alternative: check for non-empty results array
+              VCOUNT=$(jq '.results | length' terrascan.json 2>/dev/null || echo 0)
+            fi
+            if [ "$VCOUNT" -gt 0 ]; then
+              echo "Terrascan found $VCOUNT issues"
+              echo "issues=true" >> $GITHUB_OUTPUT
+            else
+              echo "issues=false" >> $GITHUB_OUTPUT
+            fi
+          elif [ -s terrascan.txt ]; then
+            # fallback: if terrascan text contains "VIOLATION" or "ERROR"
+            if grep -qiE 'violation|error|failed' terrascan.txt; then
+              echo "issues=true" >> $GITHUB_OUTPUT
+            else
+              echo "issues=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "issues=false" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: Upload Terrascan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terrascan-report
+          path: |
+            terrascan.json
+            terrascan.txt
+
+  # SCA (Trivy filesystem) - depends on SAST & IaC (seq)
+  sca-fs:
+    name: SCA - Trivy filesystem
+    runs-on: ubuntu-latest
+    needs: [sast, iac]
+    outputs:
+      issues: ${{ steps.trivy_fs_check.outputs.issues }}
+    steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Install Trivy
         run: |
           set -e -o pipefail
-          # official installer to /usr/local/bin
           curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
           trivy --version
         shell: bash
 
-      - name: Run Trivy (JSON output)
-        id: trivy_run
+      - name: Run Trivy FS (JSON + table)
+        id: trivy_fs_run
         run: |
           set -e -o pipefail
-          # produce deterministic JSON output for policy evaluation
-          # use --exit-code 0 so Trivy never fails the job on its own findings
-          /usr/local/bin/trivy fs --format json --exit-code 0 -o trivy.json .
-          echo "::debug::Trivy JSON saved to trivy.json"
-          # show a short summary for logs (non-failing)
-          /usr/local/bin/trivy fs --format table --exit-code 0 .
+          /usr/local/bin/trivy fs --format json --exit-code 0 -o trivy-fs.json .
+          /usr/local/bin/trivy fs --format table --exit-code 0 . || true
         shell: bash
 
-      - name: Install OPA CLI
+      - name: Check Trivy FS JSON for HIGH/CRITICAL (or any vuln)
+        id: trivy_fs_check
         run: |
           set -e -o pipefail
-          OPA_VERSION="v0.49.0"
-          curl -fsSL "https://openpolicyagent.org/downloads/${OPA_VERSION}/opa_linux_amd64" -o opa
-          chmod +x opa
-          sudo mv opa /usr/local/bin/opa
-          opa version
-        shell: bash
-
-      - name: Evaluate Trivy JSON with OPA policy (fail on HIGH/CRITICAL)
-        run: |
-          set -e -o pipefail
-
-          # policy file check
-          if [ ! -f ./policy/trivy_deny.rego ]; then
-            echo "policy/trivy_deny.rego not found at ./policy/trivy_deny.rego"
-            exit 1
-          fi
-
-          if [ ! -s trivy.json ]; then
-            echo "trivy.json is empty or missing — skipping OPA check (no input)."
+          if [ ! -s trivy-fs.json ]; then
+            echo "issues=false" >> $GITHUB_OUTPUT
             exit 0
           fi
+          # Count vulns across results
+          COUNT=$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-fs.json || echo 0)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "Found $COUNT vulnerabilities (any severity) in trivy-fs.json"
+            echo "issues=true" >> $GITHUB_OUTPUT
+            # Also output count of HIGH/CRITICAL for visibility
+            HC=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH" or .Severity=="CRITICAL")] | length' trivy-fs.json || echo 0)
+            echo "high_critical_count=$HC" >> $GITHUB_OUTPUT
+          else
+            echo "issues=false" >> $GITHUB_OUTPUT
+            echo "high_critical_count=0" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
 
-          echo "Evaluating policy against trivy.json..."
+      - name: Upload Trivy FS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-fs-json
+          path: trivy-fs.json
 
-          # run opa eval and capture stdout+stderr and exit code
-          OPA_CMD="opa eval -i trivy.json -d ./policy/trivy_deny.rego 'data.trivy.deny' --format json"
-          OPA_OUT=$($OPA_CMD 2>&1) || OPA_EXIT=$?
-          OPA_EXIT=${OPA_EXIT:-0}
+  # SBOM generation with Syft - depends on sca-fs
+  sbom:
+    name: SBOM - Syft
+    runs-on: ubuntu-latest
+    needs: [sca-fs]
+    outputs:
+      issues: ${{ steps.sbom_check.outputs.issues }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-          # if opa returned non-zero -> there were errors (syntax / unsafe var / runtime)
-          if [ "$OPA_EXIT" -ne 0 ]; then
-            echo "ERROR: OPA evaluation failed (exit code $OPA_EXIT)."
-            echo "$OPA_OUT"
-            exit 1
+      - name: Install Syft
+        run: |
+          set -e -o pipefail
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          syft --version
+        shell: bash
+
+      - name: Generate SBOM (CycloneDX JSON + SPDX)
+        run: |
+          set -e -o pipefail
+          /usr/local/bin/syft . -o cyclonedx-json=sbom-cyclonedx.json
+          /usr/local/bin/syft . -o spdx-json=sbom-spdx.json
+          ls -lah sbom-*.json || true
+        shell: bash
+
+      - name: SBOM basic check (no vulnerabilities detection here)
+        id: sbom_check
+        run: |
+          set -e -o pipefail
+          # SBOM job does not indicate "issues" by default; leave false unless you add checks
+          echo "issues=false" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-artifacts
+          path: |
+            sbom-cyclonedx.json
+            sbom-spdx.json
+
+  # Container security (Trivy image scan) - depends on sbom
+  container-scan:
+    name: Container Security - Build & Trivy Image Scan
+    runs-on: ubuntu-latest
+    needs: [sbom]
+    outputs:
+      issues: ${{ steps.trivy_image_check.outputs.issues }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU and Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build local Docker image
+        id: build_image
+        run: |
+          set -e -o pipefail
+          docker build -t "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" .
+          echo "image=${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Install Trivy
+        run: |
+          set -e -o pipefail
+          curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy --version
+        shell: bash
+
+      - name: Scan built image with Trivy (JSON + table)
+        id: trivy_image_run
+        run: |
+          set -e -o pipefail
+          IMAGE="${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          /usr/local/bin/trivy image --format json --exit-code 0 -o trivy-image.json "$IMAGE"
+          /usr/local/bin/trivy image --format table --exit-code 0 "$IMAGE" || true
+        shell: bash
+
+      - name: Check Trivy image JSON for findings
+        id: trivy_image_check
+        run: |
+          set -e -o pipefail
+          if [ ! -s trivy-image.json ]; then
+            echo "issues=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          COUNT=$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-image.json || echo 0)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "Found $COUNT vulnerabilities in image"
+            echo "issues=true" >> $GITHUB_OUTPUT
+          else
+            echo "issues=false" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: Upload Trivy image JSON artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-json
+          path: trivy-image.json
+
+  # Final summary + gating: runs after all and fails pipeline if any issues found
+  final-summary:
+    name: Final summary & gate
+    runs-on: ubuntu-latest
+    needs: [gitleaks, sast, iac, sca-fs, sbom, container-scan]
+    if: ${{ always() }}
+    steps:
+      - name: Aggregate results
+        run: |
+          set -e -o pipefail
+          echo "Aggregating scan results from all jobs..."
+
+          GITLEAKS_ISSUES="${{ needs.gitleaks.outputs.issues }}"
+          SEMGREP_ISSUES="${{ needs.sast.outputs.issues }}"
+          TERRASCAN_ISSUES="${{ needs.iac.outputs.issues }}"
+          TRIVY_FS_ISSUES="${{ needs.sca-fs.outputs.issues }}"
+          SBOM_ISSUES="${{ needs.sbom.outputs.issues }}"
+          TRIVY_IMAGE_ISSUES="${{ needs.container-scan.outputs.issues }}"
+
+          echo "gitleaks: $GITLEAKS_ISSUES"
+          echo "semgrep: $SEMGREP_ISSUES"
+          echo "terrascan: $TERRASCAN_ISSUES"
+          echo "trivy-fs: $TRIVY_FS_ISSUES"
+          echo "sbom: $SBOM_ISSUES"
+          echo "trivy-image: $TRIVY_IMAGE_ISSUES"
+
+          ANY=false
+          if [ "$GITLEAKS_ISSUES" = "true" ] || \
+             [ "$SEMGREP_ISSUES" = "true" ] || \
+             [ "$TERRASCAN_ISSUES" = "true" ] || \
+             [ "$TRIVY_FS_ISSUES" = "true" ] || \
+             [ "$SBOM_ISSUES" = "true" ] || \
+             [ "$TRIVY_IMAGE_ISSUES" = "true" ]; then
+            ANY=true
           fi
 
-          # pretty print OPA JSON output (optional)
-          echo "OPA output (raw):"
-          echo "$OPA_OUT" | jq .
-
-          # check if result array is empty
-          HAS_DENIES=$(echo "$OPA_OUT" | jq '.result | length > 0')
-          if [ "$HAS_DENIES" = "true" ]; then
-            echo "Policy violations found (HIGH/CRITICAL vulnerabilities) — failing the job."
-            echo "Violations:"
-            echo "$OPA_OUT" | jq -r '.result[].expressions[].value[] | "target=\(.target) vuln=\(.vulnerability) pkg=\(.package) version=\(.installed_version) severity=\(.severity) title=\(.title)"'
+          echo "any_issues=$ANY"
+          if [ "$ANY" = "true" ]; then
+            echo "One or more scanners found issues. Failing the pipeline now (after all scans finished)."
+            # optional: print a quick hint how to download artifacts
+            echo "Artifacts are uploaded to this run. Download them to inspect findings."
             exit 1
           else
-            echo "No policy violations found (no HIGH/CRITICAL vulnerabilities per policy)."
+            echo "No issues found by any scanner. Pipeline success."
           fi
         shell: bash
