@@ -1,11 +1,14 @@
-name: Run Shell Commands
-on: [push]
-
+name: gitleaks
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
 jobs:
-  run-shell-command:
+  scan:
+    name: gitleaks
     runs-on: ubuntu-latest
     steps:
-      - name: Echo a String
-        run: echo "Hello !! This is our first GitHub Actions Workflow file"
-      - name: Echo a String1
-        run: echo "Hello !! This is our first GitHub Actions Workflow file"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
