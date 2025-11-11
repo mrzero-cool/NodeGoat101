@@ -50,10 +50,10 @@ jobs:
       - name: Evaluate Trivy JSON with OPA policy (fail on HIGH/CRITICAL)
         run: |
           set -e -o pipefail
-          # ensure policy exists
+
+          # policy file check
           if [ ! -f ./policy/trivy_deny.rego ]; then
             echo "policy/trivy_deny.rego not found at ./policy/trivy_deny.rego"
-            echo "Create the policy file (see policy/trivy_deny.rego example)."
             exit 1
           fi
 
@@ -63,26 +63,31 @@ jobs:
           fi
 
           echo "Evaluating policy against trivy.json..."
-          OPA_OUT=$(opa eval -i trivy.json -d ./policy/trivy_deny.rego 'data.trivy.deny' --format json) || true
-          echo "OPA output:"
-          echo "$OPA_OUT" | jq . || echo "$OPA_OUT"
 
-          # if result array is empty -> no denies
-          EMPTY=$(echo "$OPA_OUT" | jq -e '.result | length == 0' || true)
-          if [ "$EMPTY" = "true" ]; then
-            echo "No policy violations found (no HIGH/CRITICAL vulnerabilities per policy)."
-          else
-            echo "Policy violations found (HIGH/CRITICAL vulnerabilities) — failing the job."
-            # print each deny message if present
-            echo "Violations:"
-            echo "$OPA_OUT" | jq -r '.result[].expressions[].value[]' || true
+          # run opa eval and capture stdout+stderr and exit code
+          OPA_CMD="opa eval -i trivy.json -d ./policy/trivy_deny.rego 'data.trivy.deny' --format json"
+          OPA_OUT=$($OPA_CMD 2>&1) || OPA_EXIT=$?
+          OPA_EXIT=${OPA_EXIT:-0}
+
+          # if opa returned non-zero -> there were errors (syntax / unsafe var / runtime)
+          if [ "$OPA_EXIT" -ne 0 ]; then
+            echo "ERROR: OPA evaluation failed (exit code $OPA_EXIT)."
+            echo "$OPA_OUT"
             exit 1
           fi
-        shell: bash
 
-      - name: Final summary
-        if: ${{ always() }}
-        run: |
-          set -e -o pipefail
-          echo "Workflow finished. Check above logs for Trivy and OPA details."
+          # pretty print OPA JSON output (optional)
+          echo "OPA output (raw):"
+          echo "$OPA_OUT" | jq .
+
+          # check if result array is empty
+          HAS_DENIES=$(echo "$OPA_OUT" | jq '.result | length > 0')
+          if [ "$HAS_DENIES" = "true" ]; then
+            echo "Policy violations found (HIGH/CRITICAL vulnerabilities) — failing the job."
+            echo "Violations:"
+            echo "$OPA_OUT" | jq -r '.result[].expressions[].value[] | "target=\(.target) vuln=\(.vulnerability) pkg=\(.package) version=\(.installed_version) severity=\(.severity) title=\(.title)"'
+            exit 1
+          else
+            echo "No policy violations found (no HIGH/CRITICAL vulnerabilities per policy)."
+          fi
         shell: bash
