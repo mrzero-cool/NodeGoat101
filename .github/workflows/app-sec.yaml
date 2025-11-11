@@ -39,7 +39,6 @@ jobs:
       - name: Run Semgrep SAST
         # keep non-zero exit from semgrep from failing the whole job (mirrors your original)
         run: |
-          set -e -o pipefail
           semgrep scan --config auto . || echo "Semgrep exited with non-zero code"
         shell: bash
 
