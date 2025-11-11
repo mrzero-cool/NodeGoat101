@@ -1,8 +1,9 @@
 name: AppSec Scanner
-# Runs SAST (Semgrep), SCA (Trivy), and IaC (terrascan) scans
+# Runs SAST (Semgrep), SCA (Trivy), IaC (terrascan) scans and conditionally runs OPA (conftest) if any scanner found issues
 
 on:
   push:
+    branches: [ main, master ]
   pull_request:
 
 permissions:
@@ -10,7 +11,7 @@ permissions:
 
 jobs:
   scan:
-    name: Run SAST / SCA / IaC scans
+    name: Run SAST / SCA / IaC scans + conditional OPA
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -29,51 +30,137 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install Semgrep
+      - id: semgrep
+        name: Install + Run Semgrep SAST
         run: |
           set -e -o pipefail
           python -m pip install --upgrade pip
           pip install semgrep --quiet
+          # run semgrep; capture exit code and set step output `issues=true` if non-zero
+          semgrep scan --config auto . || SEMG_EXIT=$?
+          if [ -n "${SEMG_EXIT:-}" ] && [ "$SEMG_EXIT" -ne 0 ]; then
+            echo "Semgrep found issues (exit code $SEMG_EXIT)"
+            echo "issues=true" >> $GITHUB_OUTPUT
+          else
+            echo "issues=false" >> $GITHUB_OUTPUT
+          fi
         shell: bash
 
-      - name: Run Semgrep SAST
-        # keep non-zero exit from semgrep from failing the whole job (mirrors your original)
-        run: |
-          semgrep scan --config auto . || echo "Semgrep exited with non-zero code"
-        shell: bash
-
-      - name: Install Terrascan
+      - id: terrascan
+        name: Install + Run Terrascan IaC Scan
         run: |
           set -e -o pipefail
-          # download latest terrascan release (Linux x86_64)
           API_JSON="$(curl -s https://api.github.com/repos/tenable/terrascan/releases/latest)"
           TAR_URL="$(echo "$API_JSON" | grep -o -E "https://.+?/terrascan_.*_Linux_x86_64.tar.gz" | head -n1)"
           if [ -z "$TAR_URL" ]; then
-            echo "Could not find terrascan Linux x86_64 asset in release metadata"
+            echo "Could not find terrascan Linux x86_64 asset in release metadata; skipping install"
+            echo "issues=false" >> $GITHUB_OUTPUT
             exit 0
           fi
           curl -sL "$TAR_URL" -o terrascan.tar.gz
           tar -xzf terrascan.tar.gz
           sudo install -m 0755 terrascan /usr/local/bin/ || sudo mv terrascan /usr/local/bin/terrascan
           rm -f terrascan terrascan.tar.gz
+          # run terrascan; capture exit code and set step output `issues=true` if non-zero
+          terrascan scan . || TERRA_EXIT=$?
+          if [ -n "${TERRA_EXIT:-}" ] && [ "$TERRA_EXIT" -ne 0 ]; then
+            echo "Terrascan found issues (exit code $TERRA_EXIT)"
+            echo "issues=true" >> $GITHUB_OUTPUT
+          else
+            echo "issues=false" >> $GITHUB_OUTPUT
+          fi
         shell: bash
 
-      - name: Run Terrascan IaC Scan
+      - id: trivy
+        name: Install + Run Trivy SCA Scan (filesystem)
         run: |
           set -e -o pipefail
-          terrascan scan . || echo "Terrascan exited with non-zero code"
-        shell: bash
-
-      - name: Install Trivy
-        run: |
-          set -e -o pipefail
-          # install official trivy installer script to /usr/local/bin
           curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          # run trivy; use exit-code 0 (so it won't fail the job) but we still detect non-zero internal status if needed
+          # Run with --exit-code 1 to get non-zero on vulnerabilities; here we run with 0 then check output heuristically.
+          # Simpler: run with --exit-code 1 so it returns non-zero when vulnerabilities exist.
+          trivy fs --exit-code 1 --format template --template '{{json .Results}}' . >/tmp/trivy.out 2>&1 || TRIVY_EXIT=$?
+          if [ -n "${TRIVY_EXIT:-}" ] && [ "$TRIVY_EXIT" -ne 0 ]; then
+            echo "Trivy found issues (exit code $TRIVY_EXIT)"
+            echo "issues=true" >> $GITHUB_OUTPUT
+          else
+            echo "issues=false" >> $GITHUB_OUTPUT
+          fi
         shell: bash
 
-      - name: Run Trivy SCA Scan (filesystem)
-        # keep exit code 0 (do not fail job) — change --exit-code if you want the job to fail on vulnerabilities
+      - id: check
+        name: Determine if any scanner found issues
         run: |
           set -e -o pipefail
-          trivy fs --exit-code 0 --format table .
+          # read individual step outputs into shell vars (templated at run-time)
+          SEMG="${{ steps.semgrep.outputs.issues }}"
+          TERRA="${{ steps.terrascan.outputs.issues }}"
+          TRIV="${{ steps.trivy.outputs.issues }}"
+
+          echo "semgrep issues: $SEMG"
+          echo "terrascan issues: $TERRA"
+          echo "trivy issues: $TRIV"
+
+          ANY=false
+          if [ "$SEMG" = "true" ] || [ "$TERRA" = "true" ] || [ "$TRIV" = "true" ]; then
+            ANY=true
+          fi
+
+          echo "any_issues=$ANY" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Debug: print any_issues
+        run: |
+          set -e -o pipefail
+          echo "Any issues detected: ${{ steps.check.outputs.any_issues }}"
+        shell: bash
+
+      - id: opa
+        name: Install and Run OPA (conftest) — runs only if any scanner found issues
+        if: ${{ steps.check.outputs.any_issues == 'true' }}
+        run: |
+          set -e -o pipefail
+          echo "Issues detected by one or more scanners — running OPA (conftest) checks"
+
+          # install conftest
+          CT_VERSION="v0.39.0"
+          curl -fsSL "https://github.com/open-policy-agent/conftest/releases/download/${CT_VERSION}/conftest_${CT_VERSION#v}_Linux_x86_64.tar.gz" -o conftest.tar.gz
+          tar -xzf conftest.tar.gz
+          sudo install -m 0755 conftest /usr/local/bin/ || sudo mv conftest /usr/local/bin/conftest
+          rm -f conftest conftest.tar.gz
+
+          # Run conftest against repo
+          # Place your Rego policies under ./policies (repo root) or adjust the --policy flag to point to your policies.
+          if [ ! -d ./policies ]; then
+            echo "No ./policies directory found. Create policies in ./policies (Rego) to use conftest/OPA checks."
+            # we still run conftest as a no-op (exit 0) to avoid breaking the job. Remove the following line to make it fail if no policies exist.
+            echo "issues=false" > /tmp/opa_result || true
+            exit 0
+          fi
+
+          # Example: test Kubernetes YAMLs and Terraform plan files (if present)
+          # You can adjust targets below to suit your repo.
+          conftest test --policy ./policies $(git ls-files '*.yaml' '*.yml' '*.tf' || true) || OPA_EXIT=$?
+          if [ -n "${OPA_EXIT:-}" ] && [ "$OPA_EXIT" -ne 0 ]; then
+            echo "OPA (conftest) found policy violations (exit code $OPA_EXIT)"
+            # preserve original behavior: do not fail the whole job, but surface the result
+            echo "opa_issues=true" >> $GITHUB_OUTPUT || true
+          else
+            echo "opa_issues=false" >> $GITHUB_OUTPUT || true
+          fi
+        shell: bash
+
+      - name: Final summary
+        run: |
+          set -e -o pipefail
+          echo "Summary:"
+          echo "  Semgrep issues: ${{ steps.semgrep.outputs.issues }}"
+          echo "  Terrascan issues: ${{ steps.terrascan.outputs.issues }}"
+          echo "  Trivy issues: ${{ steps.trivy.outputs.issues }}"
+          echo "  Any issues (aggregated): ${{ steps.check.outputs.any_issues }}"
+          if [ "${{ steps.check.outputs.any_issues }}" = "true" ]; then
+            echo "  OPA (conftest) was executed: ${{ steps.opa.outcome || 'ran (check logs)' }}"
+          else
+            echo "  OPA (conftest) was skipped (no issues found by scanners)."
+          fi
         shell: bash
