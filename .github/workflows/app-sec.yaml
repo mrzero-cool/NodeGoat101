@@ -76,49 +76,42 @@ jobs:
         name: Install + Run Trivy SCA Scan (filesystem)
         run: |
           set -e -o pipefail
-          curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
-          # run trivy with exit-code 1 on vulnerabilities so we can detect results
-          TRIVY_EXIT=0
-          trivy fs --exit-code 1 --format template --template '{{json .Results}}' . >/tmp/trivy.out 2>&1 || TRIVY_EXIT=$?
-          if [ "$TRIVY_EXIT" -ne 0 ]; then
-            echo "Trivy found issues (exit code $TRIVY_EXIT)"
-            echo "issues=true" >> $GITHUB_OUTPUT
-          else
-            echo "issues=false" >> $GITHUB_OUTPUT
-          fi
+          # produce JSON output for policy evaluation
+          /usr/local/bin/trivy fs --format json -o trivy.json .
         shell: bash
 
-      - id: check
-        name: Determine if any scanner found issues
+      - name: Install OPA CLI
         run: |
           set -e -o pipefail
-          SEMG="${{ steps.semgrep.outputs.issues }}"
-          TERRA="${{ steps.terrascan.outputs.issues }}"
-          TRIV="${{ steps.trivy.outputs.issues }}"
-
-          echo "semgrep issues: $SEMG"
-          echo "terrascan issues: $TERRA"
-          echo "trivy issues: $TRIV"
-
-          ANY=false
-          if [ "$SEMG" = "true" ] || [ "$TERRA" = "true" ] || [ "$TRIV" = "true" ]; then
-            ANY=true
-          fi
-
-          echo "any_issues=$ANY" >> $GITHUB_OUTPUT
+          OPA_VERSION="v0.49.0"
+          curl -fsSL "https://openpolicyagent.org/downloads/${OPA_VERSION}/opa_linux_amd64" -o opa
+          chmod +x opa
+          sudo mv opa /usr/local/bin/opa
+          opa version
         shell: bash
 
-      - name: Final summary
+      - name: Evaluate Trivy JSON with OPA policy (fail on HIGH/CRITICAL)
         run: |
           set -e -o pipefail
-          echo "Summary:"
-          echo "  Semgrep issues: ${{ steps.semgrep.outputs.issues }}"
-          echo "  Terrascan issues: ${{ steps.terrascan.outputs.issues }}"
-          echo "  Trivy issues: ${{ steps.trivy.outputs.issues }}"
-          echo "  Any issues (aggregated): ${{ steps.check.outputs.any_issues }}"
-          if [ "${{ steps.check.outputs.any_issues }}" = "true" ]; then
-            echo "  NOTE: Issues detected by one or more scanners."
+          # ensure policy file exists
+          if [ ! -f ./policy/trivy_deny.rego ]; then
+            echo "policy/trivy_deny.rego not found — create it at repo root policy/trivy_deny.rego"
+            exit 1
+          fi
+
+          # Evaluate the policy against trivy.json
+          echo "Running OPA policy against trivy.json..."
+          RES=$(opa eval -i trivy.json -d policy/trivy_deny.rego 'data.trivy.deny' --format json)
+
+          # If result array is empty, there are no denies:
+          if echo "$RES" | grep -q '"result":\s*\[\s*\]'; then
+            echo "No policy violations found (no HIGH/CRITICAL vulnerabilities)."
           else
-            echo "  No issues detected by scanners."
+            echo "Policy violations found — failing the pipeline."
+            echo "OPA result:"
+            echo "$RES" | jq . || echo "$RES"
+            # fail the job
+            exit 1
           fi
         shell: bash
+
