@@ -2,7 +2,7 @@ name: AppSec Scanner
 # Runs SAST (Semgrep), SCA (Trivy), IaC (Terrascan), SBOM (syft), Container scanning (Trivy image), and Gitleaks.
 # Each scan uploads artifacts. The pipeline does NOT fail mid-run.
 # Final job aggregates results and fails the pipeline if any job found issues.
-
+# Test
 on:
   push:
   pull_request:
